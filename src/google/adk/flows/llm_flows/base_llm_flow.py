@@ -25,6 +25,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from google.genai import types
+from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosed
 from websockets.exceptions import ConnectionClosedOK
 
@@ -50,10 +51,12 @@ from ...telemetry.tracing import trace_send_data
 from ...telemetry.tracing import tracer
 from ...tools.base_toolset import BaseToolset
 from ...tools.google_search_tool import google_search
+from ...tools.tool_confirmation import ToolConfirmation
 from ...tools.tool_context import ToolContext
 from ...utils.context_utils import Aclosing
 from .audio_cache_manager import AudioCacheManager
 from .functions import build_auth_request_event
+from .functions import REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
 from .functions import REQUEST_EUC_FUNCTION_CALL_NAME
 
 # Prefix used by toolset auth credential IDs
@@ -75,6 +78,10 @@ DEFAULT_TASK_COMPLETION_DELAY = 1.0
 
 # Statistics configuration
 DEFAULT_ENABLE_CACHE_STATISTICS = False
+
+# Session state key used to bridge HITL confirmation data between the
+# concurrent _send_to_model and _postprocess_live tasks.
+_LIVE_PENDING_CONFIRMATION_STATE_KEY = '_adk_live_pending_confirmation'
 
 
 def _finalize_model_response_event(
@@ -318,25 +325,25 @@ class BaseLlmFlow(ABC):
 
       if live_request.content:
         content = live_request.content
-        # Persist user text content to session (similar to non-live mode)
-        # Skip function responses - they are already handled separately
-        is_function_response = content.parts and any(
-            part.function_response for part in content.parts
+        if content.parts and any(part.function_response for part in content.parts):
+          # Capture confirmation data for _postprocess_live.  The
+          # function_response is not appended as a session event here; the
+          # confirmation record is created by generate_request_confirmation_event
+          # inside _dispatch_live_confirmation after the tool executes.
+          self._capture_live_confirmation_response(content, invocation_context)
+          await llm_connection.send_content(content)
+          continue
+        content.role = content.role or 'user'
+        await invocation_context.session_service.append_event(
+            session=invocation_context.session,
+            event=Event(
+                id=Event.new_id(),
+                invocation_id=invocation_context.invocation_id,
+                author='user',
+                content=content,
+            ),
         )
-        if not is_function_response:
-          if not content.role:
-            content.role = 'user'
-          user_content_event = Event(
-              id=Event.new_id(),
-              invocation_id=invocation_context.invocation_id,
-              author='user',
-              content=content,
-          )
-          await invocation_context.session_service.append_event(
-              session=invocation_context.session,
-              event=user_content_event,
-          )
-        await llm_connection.send_content(live_request.content)
+        await llm_connection.send_content(content)
 
   async def _receive_from_model(
       self,
@@ -738,6 +745,27 @@ class BaseLlmFlow(ABC):
       async for event in agen:
         yield event
 
+    # Handle HITL confirmations arriving as a control-only turn_complete.
+    # When the client sends a confirmation reply, _send_to_model forwards it
+    # as a function_response and the model acknowledges with a turn_complete
+    # that carries no content, transcription, or error signal.
+    if bool(llm_response.turn_complete) and not any((
+        llm_response.content,
+        llm_response.error_code,
+        llm_response.interrupted,
+        llm_response.input_transcription,
+        llm_response.output_transcription,
+    )):
+      async with Aclosing(
+          self._dispatch_live_confirmation(invocation_context, llm_request)
+      ) as agen:
+        dispatched = False
+        async for event in agen:
+          dispatched = True
+          yield event
+        if dispatched:
+          return
+
     # Skip the model response event if there is no content and no error code.
     # This is needed for the code executor to trigger another loop.
     # But don't skip control events like turn_complete or transcription events.
@@ -810,6 +838,189 @@ class BaseLlmFlow(ABC):
             )
         )
         yield final_event
+
+  def _capture_live_confirmation_response(
+      self,
+      content: types.Content,
+      invocation_context: InvocationContext,
+  ) -> None:
+    """Captures HITL confirmation responses into session state.
+
+    Called from _send_to_model when a function_response for request_confirmation
+    is forwarded to the model.  The data is stored under
+    _LIVE_PENDING_CONFIRMATION_STATE_KEY so _dispatch_live_confirmation can
+    retrieve it on the subsequent control-only turn_complete.
+
+    Args:
+      content: The Content from the live request containing function responses.
+      invocation_context: The current invocation context.
+    """
+    responses = {
+        str(fr.id): fr.response
+        for part in content.parts or []
+        if (fr := part.function_response)
+        and fr.name == REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
+        and fr.id
+        and isinstance(fr.response, dict)
+    }
+    if not responses or not isinstance(
+        state := invocation_context.session.state, dict
+    ):
+      return
+    state[_LIVE_PENDING_CONFIRMATION_STATE_KEY] = {
+        'confirmation_response_ids': list(responses),
+        'confirmation_responses': responses,
+        'invocation_id': invocation_context.invocation_id,
+    }
+    logger.debug(
+        'Captured %d live HITL confirmation(s) for invocation %s.',
+        len(responses),
+        invocation_context.invocation_id,
+    )
+
+  async def _dispatch_live_confirmation(
+      self,
+      invocation_context: InvocationContext,
+      llm_request: LlmRequest,
+  ) -> AsyncGenerator[Event, None]:
+    """Dispatches HITL tool executions from pending confirmation state.
+
+    Called from _postprocess_live on a control-only turn_complete — the model's
+    acknowledgement of the client's confirmation function_response.  Reads state
+    written by _capture_live_confirmation_response, reconstructs the original
+    function calls, and delegates to handle_function_call_list_async.
+
+    Args:
+      invocation_context: The current invocation context.
+      llm_request: The LLM request carrying the tools dict.
+
+    Yields:
+      Events produced by the confirmed tool executions.
+    """
+    state = invocation_context.session.state
+    if not isinstance(state, dict):
+      return
+
+    pending_confirmation = state.get(_LIVE_PENDING_CONFIRMATION_STATE_KEY)
+    if not isinstance(pending_confirmation, dict):
+      return
+    if (
+        pending_confirmation.get('invocation_id')
+        != invocation_context.invocation_id
+    ):
+      return
+
+    pending_id_set = {
+        str(pid)
+        for pid in pending_confirmation.get('confirmation_response_ids') or []
+    }
+    pending_confirmation_responses = (
+        pending_confirmation.get('confirmation_responses') or {}
+    )
+
+    original_function_calls_by_id: dict[str, types.FunctionCall] = {}
+    pending_tool_confirmations: dict[str, ToolConfirmation] = {}
+    # _get_events filters by branch, which session.events does not; this is
+    # necessary in multi-agent scenarios where sibling branches share a session.
+    for session_event in reversed(
+        invocation_context._get_events(current_branch=True)
+    ):
+      for function_call in session_event.get_function_calls():
+        function_call_id = str(function_call.id or '')
+        if function_call_id not in pending_id_set:
+          continue
+        original_call_payload = (function_call.args or {}).get(
+            'originalFunctionCall'
+        )
+        if not isinstance(original_call_payload, dict):
+          continue
+        try:
+          original_function_call = types.FunctionCall(**original_call_payload)
+        except (TypeError, ValidationError):
+          logger.warning(
+              'Live HITL: malformed originalFunctionCall payload for %s: %s',
+              function_call_id,
+              original_call_payload,
+          )
+          continue
+        original_call_id = str(original_function_call.id or '')
+        if not original_call_id:
+          continue
+        original_function_calls_by_id[original_call_id] = original_function_call
+
+        response_payload = pending_confirmation_responses.get(function_call_id)
+        if not isinstance(response_payload, dict):
+          continue
+        try:
+          pending_tool_confirmations[original_call_id] = (
+              ToolConfirmation.model_validate(response_payload)
+          )
+        except (TypeError, ValidationError):
+          logger.warning(
+              'Live HITL: malformed ToolConfirmation payload for %s: %s',
+              function_call_id,
+              response_payload,
+          )
+          continue
+
+    if not original_function_calls_by_id or not pending_tool_confirmations:
+      # No actionable calls found — clear state so subsequent turn_completes
+      # are not misidentified as HITL confirmations.
+      state.pop(_LIVE_PENDING_CONFIRMATION_STATE_KEY, None)
+      return
+
+    function_response_event = await functions.handle_function_call_list_async(
+        invocation_context,
+        list(original_function_calls_by_id.values()),
+        llm_request.tools_dict,
+        set(original_function_calls_by_id.keys()),
+        pending_tool_confirmations,
+    )
+    if not function_response_event:
+      state.pop(_LIVE_PENDING_CONFIRMATION_STATE_KEY, None)
+      return
+
+    # Clear consumed state so subsequent turn_completes are not misidentified.
+    state.pop(_LIVE_PENDING_CONFIRMATION_STATE_KEY, None)
+
+    if auth_event := functions.generate_auth_event(
+        invocation_context, function_response_event
+    ):
+      yield auth_event
+
+    # A synthetic function-call event is required so that
+    # generate_request_confirmation_event can build the confirmation record
+    # expected by the session log.
+    synthetic_function_call_event = Event(
+        id=Event.new_id(),
+        invocation_id=invocation_context.invocation_id,
+        author=invocation_context.agent.name,
+        branch=invocation_context.branch,
+        content=types.Content(
+            role='model',
+            parts=[
+                types.Part(function_call=fc)
+                for fc in original_function_calls_by_id.values()
+            ],
+        ),
+    )
+    if tool_confirmation_event := functions.generate_request_confirmation_event(
+        invocation_context,
+        synthetic_function_call_event,
+        function_response_event,
+    ):
+      if function_response_event.actions:
+        function_response_event.actions.requested_tool_confirmations = {}
+      yield tool_confirmation_event
+
+    yield function_response_event
+
+    if json_response := _output_schema_processor.get_structured_model_response(
+        function_response_event
+    ):
+      yield _output_schema_processor.create_final_model_response_event(
+          invocation_context, json_response
+      )
 
   async def _postprocess_run_processors_async(
       self, invocation_context: InvocationContext, llm_response: LlmResponse
